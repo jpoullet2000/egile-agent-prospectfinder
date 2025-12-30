@@ -29,6 +29,7 @@ env/
 ENV/
 env.bak/
 venv.bak/
+.venv/
 
 # IDE
 .vscode/
@@ -54,3 +55,12 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite3
+agent_os.db
+
+
+# Environment variables
+.env
