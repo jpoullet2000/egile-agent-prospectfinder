@@ -25,7 +25,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import uvicorn
 
-from egile_agent_core.models import OpenAI, XAI
+from egile_agent_core.models import OpenAI, XAI, Mistral
 from egile_agent_core.server import create_agent_os
 from egile_agent_prospectfinder import ProspectFinderPlugin
 
@@ -50,10 +50,18 @@ def create_prospectfinder_agent_os():
     )
     
     # Configure agent with the plugin
+    # Model selection priority: Mistral > XAI > OpenAI
+    if os.getenv("MISTRAL_API_KEY"):
+        model = Mistral(model="mistral-large-latest")
+    elif os.getenv("XAI_API_KEY"):
+        model = XAI(model="grok-4-1-fast-reasoning")
+    else:
+        model = OpenAI(model="gpt-4o-mini")
+    
     agents_config = [
         {
             "name": "prospectfinder",
-            "model": XAI(model="grok-4-1-fast-reasoning") if os.getenv("XAI_API_KEY") else OpenAI(model="gpt-4o-mini"),
+            "model": model,
             "description": "AI agent that finds business prospects in specific sectors and countries.",
             "instructions": [
                 "You are a business development assistant specialized in finding prospects.",
