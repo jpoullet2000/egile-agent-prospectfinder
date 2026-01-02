@@ -52,11 +52,11 @@ def create_prospectfinder_agent_os():
     # Configure agent with the plugin
     # Model selection priority: Mistral > XAI > OpenAI
     if os.getenv("MISTRAL_API_KEY"):
-        model = Mistral(model="mistral-large-latest")
+        model = Mistral(model=os.getenv("MISTRAL_MODEL", "mistral-large-2512"))
     elif os.getenv("XAI_API_KEY"):
-        model = XAI(model="grok-4-1-fast-reasoning")
+        model = XAI(model=os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning"))
     else:
-        model = OpenAI(model="gpt-4o-mini")
+        model = OpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     
     agents_config = [
         {
