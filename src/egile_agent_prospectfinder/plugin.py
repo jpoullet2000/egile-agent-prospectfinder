@@ -208,3 +208,40 @@ class ProspectFinderPlugin(Plugin):
             "find_prospects": self.find_prospects,
             "list_available_tools": self.list_available_tools,
         }
+    
+    def get_tools(self) -> list[dict[str, Any]]:
+        """
+        Get OpenAI-compatible tool definitions for function calling.
+        
+        Returns:
+            List of tool definitions in OpenAI function calling format
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "find_prospects",
+                    "description": "Search for business prospects in a specific sector and country. Returns detailed information about companies including names, descriptions, and contact details.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sector": {
+                                "type": "string",
+                                "description": "The business sector to search for (e.g., 'Marketing', 'Construction', 'Technology', 'Healthcare', 'Finance', 'fintech')",
+                            },
+                            "country": {
+                                "type": "string",
+                                "description": "The country to search in (e.g., 'Belgium', 'France', 'Netherlands')",
+                                "default": "Belgium",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return (default: 10, max: 50)",
+                                "default": 10,
+                            },
+                        },
+                        "required": ["sector"],
+                    },
+                },
+            }
+        ]
