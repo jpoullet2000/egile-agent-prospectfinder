@@ -6,7 +6,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from egile_agent_core.plugins import Plugin
-
 from .mcp_client import MCPClient
 
 if TYPE_CHECKING:
@@ -49,23 +48,30 @@ class ProspectFinderPlugin(Plugin):
         self,
         mcp_host: str = "localhost",
         mcp_port: int = 8000,
-        mcp_transport: str = "sse",
+        mcp_transport: str = "stdio",
+        mcp_command: Optional[str] = None,
         timeout: float = 30.0,
+        use_mcp: bool = False,
     ):
         """
         Initialize the ProspectFinder plugin.
 
         Args:
-            mcp_host: Host where the MCP server is running
-            mcp_port: Port where the MCP server is running
-            mcp_transport: Transport mode ("sse" or "stdio")
+            mcp_host: Host where the MCP server is running (for SSE transport)
+            mcp_port: Port where the MCP server is running (for SSE transport)
+            mcp_transport: Transport mode - "stdio" (recommended) or "sse"
+            mcp_command: Command to start MCP server (for stdio transport)
             timeout: Request timeout in seconds
+            use_mcp: If True, use MCP client; if False, use direct search_service (default: False for Windows compatibility)
         """
         self.mcp_host = mcp_host
         self.mcp_port = mcp_port
         self.mcp_transport = mcp_transport
+        self.mcp_command = mcp_command or "python -m egile_mcp_prospectfinder.server"
         self.timeout = timeout
+        self.use_mcp = use_mcp
         self._client: Optional[MCPClient] = None
+        self._search_service = None
         self._agent: Optional[Agent] = None
 
     @property
@@ -77,7 +83,7 @@ class ProspectFinderPlugin(Plugin):
     def description(self) -> str:
         """Plugin description."""
         return (
-            "Provides business prospect finding capabilities via MCP server. "
+            "Provides business prospect finding capabilities via direct search service. "
             "Can search for companies in specific sectors and countries."
         )
 
@@ -90,28 +96,33 @@ class ProspectFinderPlugin(Plugin):
         """
         Called when the agent starts.
         
-        Initializes the MCP client connection.
+        Connects to the MCP server or initializes direct search service.
 
         Args:
             agent: The Agent instance that is starting
         """
         self._agent = agent
-        try:
-            self._client = MCPClient(
-                transport=self.mcp_transport,
-                host=self.mcp_host,
-                port=self.mcp_port,
-                timeout=self.timeout,
-            )
-            # Connect to the MCP server
-            await self._client.connect()
-            logger.info(
-                f"ProspectFinder plugin connected to MCP server at "
-                f"{self.mcp_host}:{self.mcp_port}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server: {e}")
-            raise
+        
+        if self.use_mcp:
+            # Use MCP client (external compatibility mode)
+            try:
+                self._client = MCPClient(
+                    transport=self.mcp_transport,
+                    host=self.mcp_host,
+                    port=self.mcp_port,
+                    command=self.mcp_command,
+                    timeout=self.timeout,
+                )
+                await self._client.connect()
+                logger.info(f"ProspectFinder plugin connected to MCP server via {self.mcp_transport}")
+            except Exception as e:
+                logger.error(f"Failed to connect to MCP server: {e}")
+                raise
+        else:
+            # Use direct mode (faster, more reliable)
+            from egile_mcp_prospectfinder.search_service import SearchService
+            self._search_service = SearchService()
+            logger.info("ProspectFinder plugin initialized in direct mode (using search_service)")
 
     async def find_prospects(
         self, sector: str, country: str = "Belgium", limit: int = 10
@@ -128,24 +139,43 @@ class ProspectFinderPlugin(Plugin):
             Formatted string with search results
 
         Raises:
-            RuntimeError: If MCP client is not initialized
+            RuntimeError: If plugin is not initialized
         """
-        if not self._client:
-            raise RuntimeError(
-                "MCP client not initialized. Ensure the plugin is properly started."
-            )
-
         logger.info(
             f"Searching for prospects: sector={sector}, country={country}, limit={limit}"
         )
         
         try:
-            results = await self._client.find_prospects(sector, country, limit)
-            logger.info(f"Successfully retrieved prospects for {sector} in {country}")
-            return results
+            if self.use_mcp:
+                # Use MCP client
+                if not self._client:
+                    raise RuntimeError("MCP client not initialized. Call on_agent_start first.")
+                result = await self._client.find_prospects(
+                    sector=sector, country=country, limit=limit
+                )
+            else:
+                # Use direct search service
+                if not self._search_service:
+                    raise RuntimeError("Search service not initialized. Call on_agent_start first.")
+                
+                # Call search_service directly (synchronous)
+                results = self._search_service.search_prospects(sector, country, limit)
+                
+                # Return compact structured data that the LLM will format
+                if not results:
+                    result = f"No prospects found for {sector} in {country}."
+                else:
+                    # Compact format - just title, URL, and key details
+                    result = f"Found {len(results)} {sector} prospects in {country}:\n\n"
+                    for i, res in enumerate(results, 1):
+                        result += f"{i}. {res['title']} - {res['link']}\n"
+            
+            logger.info(f"Search completed: {len(result)} characters")
+            return result
         except Exception as e:
-            logger.error(f"Error finding prospects: {e}")
-            raise
+            error_msg = f"Failed to search for prospects: {str(e)}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
     async def on_message_received(self, message: str, **kwargs: Any) -> str:
         """

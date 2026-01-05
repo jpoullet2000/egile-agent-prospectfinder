@@ -4,41 +4,48 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+from contextlib import AsyncExitStack
 
-import httpx
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 
 logger = logging.getLogger(__name__)
 
 
 class MCPClient:
     """
-    Simple HTTP client for communicating with the ProspectFinder MCP server.
+    MCP client for communicating with the ProspectFinder MCP server.
     
-    Supports SSE (HTTP) transport to call MCP tools.
+    Supports both stdio (recommended) and SSE transports.
     """
 
     def __init__(
         self,
-        transport: str = "sse",
+        transport: str = "stdio",
         host: str = "localhost",
         port: int = 8000,
+        command: Optional[str] = None,
         timeout: float = 30.0,
     ):
         """
         Initialize the MCP client.
 
         Args:
-            transport: Transport mode - "sse" (HTTP) only
-            host: Server host
-            port: Server port
+            transport: Transport mode - "stdio" (recommended) or "sse"
+            host: Server host (for SSE transport)
+            port: Server port (for SSE transport)
+            command: Command to start MCP server (for stdio transport)
             timeout: Request timeout in seconds
         """
         self.transport = transport
         self.host = host
         self.port = port
+        self.command = command
         self.timeout = timeout
-        self.base_url = f"http://{host}:{port}"
-        self._client: Optional[httpx.AsyncClient] = None
+        self.base_url = f"http://{host}:{port}/sse"  # For SSE
+        self._session: Optional[ClientSession] = None
+        self._exit_stack: Optional[AsyncExitStack] = None
 
     async def __aenter__(self) -> MCPClient:
         """Async context manager entry."""
@@ -51,27 +58,69 @@ class MCPClient:
 
     async def connect(self) -> None:
         """Establish connection to the MCP server."""
-        if self._client is not None:
+        if self._session is not None:
             return  # Already connected
             
-        if self.transport == "sse":
+        self._exit_stack = AsyncExitStack()
+        
+        if self.transport == "stdio":
+            # Use stdio transport - spawn server as subprocess
+            if not self.command:
+                raise ValueError("command is required for stdio transport")
+            
+            logger.info(f"Starting MCP server via stdio: {self.command}")
+            
+            # Parse command into list
+            import shlex
+            command_list = shlex.split(self.command)
+            
+            server_params = StdioServerParameters(
+                command=command_list[0],
+                args=command_list[1:],
+                env=None
+            )
+            
+            stdio_transport = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(stdio_transport[0], stdio_transport[1])
+            )
+            
+            await self._session.initialize()
+            logger.info("MCP client connected via stdio and initialized")
+            
+        elif self.transport == "sse":
+            # Use SSE transport - connect to existing server
             logger.info(f"Connecting to MCP server at {self.base_url}")
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            
+            sse_transport = await self._exit_stack.enter_async_context(
+                sse_client(self.base_url)
+            )
+            
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(sse_transport[0], sse_transport[1])
+            )
+            
+            await self._session.initialize()
+            logger.info("MCP client connected via SSE and initialized")
         else:
             raise ValueError(f"Unsupported transport: {self.transport}")
 
     async def close(self) -> None:
-        """Close the client connection."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """Close the MCP client connection."""
+        if self._exit_stack is not None:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+            self._session = None
             logger.info("MCP client connection closed")
 
     async def call_tool(
         self, tool_name: str, arguments: Optional[dict[str, Any]] = None
     ) -> str:
         """
-        Call a tool on the MCP server via HTTP.
+        Call a tool on the MCP server using the MCP SDK with timeout protection.
 
         Args:
             tool_name: Name of the tool to call
@@ -79,47 +128,42 @@ class MCPClient:
 
         Returns:
             The tool response as a string
-
-        Raises:
-            RuntimeError: If client is not connected
-            httpx.HTTPError: If the HTTP request fails
         """
-        if self._client is None:
-            await self.connect()
+        if not self._session:
+            raise RuntimeError("MCP client not connected. Call connect() first.")
         
-        if self._client is None:
-            raise RuntimeError("Failed to connect to MCP server")
-
+        arguments = arguments or {}
+        logger.info(f"🔌 MCP CLIENT: Calling tool '{tool_name}' with arguments: {arguments}")
+        
         try:
-            logger.info(f"Calling MCP tool '{tool_name}' with arguments: {arguments}")
+            import asyncio
             
-            # Use FastMCP's HTTP endpoint
-            # FastMCP exposes tools at /call_tool endpoint
-            response = await self._client.post(
-                f"{self.base_url}/call_tool",
-                json={
-                    "tool_name": tool_name,
-                    "arguments": arguments or {}
-                }
+            # Add aggressive timeout to prevent hanging
+            result = await asyncio.wait_for(
+                self._session.call_tool(tool_name, arguments=arguments),
+                timeout=self.timeout
             )
-            response.raise_for_status()
             
-            result = response.json()
-            logger.info(f"Successfully called tool '{tool_name}'")
+            # Extract text content from result
+            if hasattr(result, 'content') and result.content:
+                # result.content is a list of TextContent or ImageContent objects
+                text_parts = []
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_parts.append(content_item.text)
+                result_text = '\n'.join(text_parts)
+            else:
+                result_text = str(result)
             
-            # FastMCP returns the tool result
-            if isinstance(result, str):
-                return result
-            elif isinstance(result, dict) and "result" in result:
-                return str(result["result"])
+            logger.info(f"🔌 MCP CLIENT: Tool completed, {len(result_text)} chars returned")
+            return result_text
             
-            return str(result)
-
-        except httpx.HTTPError as e:
-            logger.error(f"HTTP error calling MCP tool '{tool_name}': {e}")
-            raise
+        except asyncio.TimeoutError:
+            error_msg = f"Tool '{tool_name}' timed out after {self.timeout}s"
+            logger.error(f"🔌 MCP CLIENT: {error_msg}")
+            raise TimeoutError(error_msg)
         except Exception as e:
-            logger.error(f"Error calling MCP tool '{tool_name}': {e}")
+            logger.error(f"🔌 MCP CLIENT: Tool '{tool_name}' failed: {type(e).__name__}: {e}")
             raise
 
     async def find_prospects(
@@ -151,17 +195,23 @@ class MCPClient:
         Returns:
             List of tool definitions
         """
-        if self._client is None:
+        if self._session is None:
             await self.connect()
             
-        if self._client is None:
-            raise RuntimeError("Failed to connect to MCP server")
+        if self._session is None:
+            raise RuntimeError("Failed to initialize MCP session")
             
         try:
-            response = await self._client.get(f"{self.base_url}/tools")
-            response.raise_for_status()
-            result = response.json()
-            return result if isinstance(result, list) else []
+            result = await self._session.list_tools()
+            # Convert MCP tool definitions to dict format
+            return [
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "inputSchema": tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                }
+                for tool in result.tools
+            ] if hasattr(result, 'tools') else []
         except Exception as e:
             logger.error(f"Error listing MCP tools: {e}")
             return []
