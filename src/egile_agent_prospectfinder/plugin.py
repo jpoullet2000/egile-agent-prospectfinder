@@ -92,6 +92,11 @@ class ProspectFinderPlugin(Plugin):
         """Plugin version."""
         return "0.1.0"
 
+    @property
+    def mcp_server_module(self) -> str:
+        """MCP server module path."""
+        return "egile_mcp_prospectfinder.server"
+
     async def on_agent_start(self, agent: Agent) -> None:
         """
         Called when the agent starts.
